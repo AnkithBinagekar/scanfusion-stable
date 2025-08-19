@@ -5,6 +5,7 @@ import nibabel as nib
 import numpy as np
 import torch
 import imageio
+import cv2   # ### NEW
 from monai.transforms import (
     LoadImaged, EnsureChannelFirstd, Spacingd, ScaleIntensityRanged,
     CropForegroundd, Orientationd, Resized, Compose, EnsureTyped, NormalizeIntensityd
@@ -40,7 +41,7 @@ def save_slices_as_jpg(volume, prefix):
     for i in range(volume.shape[-1]):
         slice_img = volume[..., i]
         img = Image.fromarray(slice_img)
-        filename = f"{prefix}slice{i:03d}.jpg"
+        filename = f"{prefix}_slice{i:03d}.jpg"
         filepath = os.path.join(STATIC_DIR, filename)
         img.save(filepath)
         slice_paths.append(filepath)
@@ -52,11 +53,39 @@ def create_gif(slice_paths, gif_name):
     imageio.mimsave(gif_path, images, fps=10)
     return f"static/{gif_name}"
 
+### NEW: Overlay function
+def save_overlay_slices(input_vol, mask_vol, prefix="overlay", alpha=0.4):
+    """Overlay segmentation mask on input volume slices and save as JPGs."""
+    slice_paths = []
+    # Normalize input to 0-255 grayscale
+    input_norm = (input_vol - input_vol.min()) / (input_vol.max() - input_vol.min() + 1e-8)
+    input_norm = (input_norm * 255).astype(np.uint8)
+
+    for i in range(input_norm.shape[-1]):
+        base_slice = input_norm[..., i]
+        mask_slice = mask_vol[..., i]
+
+        # Convert grayscale to BGR
+        base_bgr = cv2.cvtColor(base_slice, cv2.COLOR_GRAY2BGR)
+
+        # Apply color map to mask (e.g. applyJet colormap or custom colors)
+        mask_color = np.zeros_like(base_bgr)
+        mask_color[mask_slice > 0] = [0, 0, 255]  # red overlay
+
+        # Blend images
+        overlay = cv2.addWeighted(base_bgr, 1.0, mask_color, alpha, 0)
+
+        filename = f"{prefix}_slice{i:03d}.jpg"
+        filepath = os.path.join(STATIC_DIR, filename)
+        cv2.imwrite(filepath, overlay)
+        slice_paths.append(filepath)
+
+    return slice_paths
+
 # -----------------
-# PREPROCESSING (from Colab)
+# PREPROCESSING
 # -----------------
 def get_transforms(pixdim=(1.0, 1.0, 1.0), spatial_size=(128, 128, 64)):
-   
     return Compose([
         LoadImaged(keys=["image"]),
         EnsureChannelFirstd(keys=["image"]),
@@ -64,12 +93,6 @@ def get_transforms(pixdim=(1.0, 1.0, 1.0), spatial_size=(128, 128, 64)):
         Orientationd(keys=["image"], axcodes="RAS"),
         NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
         Spacingd(keys=["image"], pixdim=pixdim, mode=("bilinear")),
-       # ScaleIntensityRanged(
-          #  keys=["image"], a_min=0, a_max=3000,
-            #b_min=0.0, b_max=1.0, clip=True
-        #),
-        #CropForegroundd(keys=["image"], source_key="image"),
-        #Resized(keys=["image"], spatial_size=spatial_size, mode="trilinear")
     ])
 
 # -----------------
@@ -88,7 +111,6 @@ def run_segmentation(input_path, model_path, output_dir):
     elif input_path.endswith(".nii.gz") or input_path.endswith(".nii"):
         modalities = [input_path]
 
-    # If single FLAIR, repeat to make 4 channels
     if len(modalities) == 1:
         print("🧠 Single FLAIR detected (4x repeat)")
         modalities = modalities * 4
@@ -96,20 +118,19 @@ def run_segmentation(input_path, model_path, output_dir):
     if len(modalities) != 4:
         raise ValueError(f"Expected 4 modalities, got {len(modalities)}")
 
-    # Load data using MONAI Dataset
+    # Load data
     data_dict = [{"image": m} for m in modalities]
     transform = get_transforms()
     dataset = Dataset(data=data_dict, transform=transform)
     loader = DataLoader(dataset, batch_size=1)
-    print("Data loader Initialzed")
-    # Stack modalities into one 4-channel tensor
+
     data_4ch = []
     for batch in loader:
         img = batch["image"]  # shape: (1, 1, H, W, D)
-        data_4ch.append(img.squeeze(0))  # remove batch dim
-    data_4ch = torch.cat(data_4ch, dim=0).unsqueeze(0).to(DEVICE)  # shape: (1, 4, H, W, D)
+        data_4ch.append(img.squeeze(0))
+    data_4ch = torch.cat(data_4ch, dim=0).unsqueeze(0).to(DEVICE)
 
-    # Load model
+    # Model
     model = SegResNet(
         blocks_down=(1, 2, 2, 4),
         blocks_up=(1, 1, 1),
@@ -118,41 +139,33 @@ def run_segmentation(input_path, model_path, output_dir):
         out_channels=3,
         dropout_prob=0.2
     ).to(DEVICE)
-
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
-    print("model initialzed and loaded")
-    # Inference
+
     with torch.no_grad():
         output = sliding_window_inference(
-           data_4ch, roi_size=(240, 240, 160),overlap=0.5, sw_batch_size=1, predictor=model
-           #data_4ch, roi_size=(128, 128, 64),overlap=0.5, sw_batch_size=1, predictor=model
+            data_4ch, roi_size=(240, 240, 160), overlap=0.5, sw_batch_size=1, predictor=model
         )
 
-    print("Model output shape:", output.shape, flush=True)
-   # Argmax to get label map
-    #pred_label = torch.argmax(output, dim=1).cpu().numpy()
-    #print("Unique labels in prediction:", np.unique(pred_label), flush=True)
-    #print("="*50 + "\n")
-    # Postprocessing
+    # Postprocess
     output = Activations(sigmoid=True)(output)
     output = AsDiscrete(threshold=0.5)(output)
 
-    # Match depths
     if output.shape[-1] != data_4ch.shape[-1]:
         min_d = min(output.shape[-1], data_4ch.shape[-1])
         output = output[..., :min_d]
         data_4ch = data_4ch[..., :min_d]
 
-    # Convert tensors to numpy for saving
-    input_np = data_4ch.cpu().numpy()[0, 0, ...]  # just FLAIR channel for display
-    output_np = output.cpu().numpy()[0, 1, ...]   # tumor mask channel 2
+    # Convert tensors to numpy
+    input_np = data_4ch.cpu().numpy()[0, 0, ...]
+    output_np = output.cpu().numpy()[0, 1, ...]
 
     # Save slices
     input_slices = save_slices_as_jpg(input_np, "input")
     output_slices = save_slices_as_jpg((output_np * 255).astype(np.uint8), "output")
+    overlay_slices = save_overlay_slices(input_np, output_np, prefix="overlay")  # ### NEW
 
     # Create GIF
     gif_url = create_gif(output_slices, "output.gif")
 
-    return input_slices, output_slices, gif_url
+    return input_slices, output_slices, overlay_slices, gif_url

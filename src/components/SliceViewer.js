@@ -1,17 +1,30 @@
-import React, { useContext } from 'react';
-import { ImageContext } from '../contexts/ImageContext';
+import React, { useContext } from "react";
+import { ImageContext } from "../contexts/ImageContext";
+
+const API_BASE = "http://localhost:8000";
+
+function resolveUrl(p) {
+  if (!p) return "";
+  if (p.startsWith("http://") || p.startsWith("https://")) return p;
+  if (p.startsWith("/")) return `${API_BASE}${p}`;
+  return `${API_BASE}/${p}`;
+}
 
 const SliceViewer = () => {
   const {
     inputSlices,
     outputSlices,
-    showOutput,
-    setShowOutput,
+    overlaySlices,
+    showMode,
+    setShowMode,
     currentIndex,
     setCurrentIndex,
   } = useContext(ImageContext);
 
-  const slicesToShow = showOutput ? outputSlices : inputSlices;
+  let slicesToShow = [];
+  if (showMode === "input") slicesToShow = inputSlices;
+  if (showMode === "mask") slicesToShow = outputSlices;
+  if (showMode === "overlay") slicesToShow = overlaySlices;
 
   return (
     <div>
@@ -21,27 +34,38 @@ const SliceViewer = () => {
         <div className="text-gray-400">No slices to preview yet.</div>
       ) : (
         <div className="text-white">
+          {/* Mode Switch */}
           <div className="mb-4 flex items-center justify-between">
             <div>
               <label className="mr-4">
                 <input
                   type="radio"
                   name="view"
-                  checked={!showOutput}
-                  onChange={() => setShowOutput(false)}
+                  checked={showMode === "input"}
+                  onChange={() => setShowMode("input")}
                   className="mr-1"
                 />
                 Input
+              </label>
+              <label className="mr-4">
+                <input
+                  type="radio"
+                  name="view"
+                  checked={showMode === "mask"}
+                  onChange={() => setShowMode("mask")}
+                  className="mr-1"
+                />
+                Segmentation Mask
               </label>
               <label>
                 <input
                   type="radio"
                   name="view"
-                  checked={showOutput}
-                  onChange={() => setShowOutput(true)}
+                  checked={showMode === "overlay"}
+                  onChange={() => setShowMode("overlay")}
                   className="mr-1"
                 />
-                Output
+                Overlay
               </label>
             </div>
             <div>
@@ -49,12 +73,14 @@ const SliceViewer = () => {
             </div>
           </div>
 
+          {/* Image Preview */}
           <img
-            src={slicesToShow[currentIndex]}
+            src={resolveUrl(slicesToShow[currentIndex])}
             alt="Slice Preview"
             className="w-full max-w-md mx-auto mb-4 rounded shadow"
           />
 
+          {/* Slider */}
           <input
             type="range"
             min="0"

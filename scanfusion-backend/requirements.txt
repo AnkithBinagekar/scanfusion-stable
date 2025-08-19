@@ -6,3 +6,4 @@ nibabel
 numpy
 matplotlib
 pillow
+opencv-python-headless
